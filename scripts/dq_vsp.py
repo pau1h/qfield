@@ -239,6 +239,15 @@ class DQVSP:
             opt.step()
             _sync(self.dev)
             training_times.append(time.perf_counter() - t_tr)
+            if (step + 1) % 50 == 0:
+                wait = float(np.mean(sampling_times[-50:]))
+                train = float(np.mean(training_times[-50:]))
+                print(
+                    f"[pipeline] step {step + 1}/{a.n_steps} | "
+                    f"batch wait {wait:.2f} s | QField step {train:.2f} s | "
+                    f"waiting {wait / (wait + train):.0%}",
+                    flush=True,
+                )
 
             if timed:
                 timing_by_m[M]["sampling"].append(sampling_times[-1])
