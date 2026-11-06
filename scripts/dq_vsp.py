@@ -212,6 +212,7 @@ class DQVSP:
         n_warmup = warmup_per_m * len(self.m_list)
 
         batches = training_batches(self.y_tr, a) #returns a generator. if qfield is faster than sample generation, it will pause and wait.
+        ck_dir = checkpointsdir(a.experiment)
         for step in range(int(a.n_steps)):
             timed = step >= n_warmup
             t_s = time.perf_counter()
@@ -279,6 +280,26 @@ class DQVSP:
                               f"{step}; best {best_val:.4e} restored",
                               flush=True)
                         break
+            completed = step + 1
+            if completed % 5000 == 0 or completed == int(a.n_steps):
+                path = os.path.join(ck_dir, f"step_{completed:06d}.pth")
+                tmp = path + ".tmp"
+                torch.save({
+                    "step": completed,
+                    "sigma": self.sigma,
+                    "state_dict": net.state_dict(),
+                    "train_curve": curve,
+                    "val_curve": val_curve,
+                    "optimizer_state_dict": opt.state_dict(),
+                    "ema": ema,
+                    "best_val": best_val,
+                    "best_sd": best_sd,
+                    "n_stale": n_stale,
+                    "torch_rng_state": torch.get_rng_state(),
+                    "args": vars(a).copy(),
+                }, tmp)
+                os.replace(tmp, path)
+                print(f"Saved snapshot to {path}", flush=True)
 
         batches.close()  # Releases workers after normal completion or early stop.
         sample_label = "batch wait" if int(a.sampler_workers) else "DDPM"
@@ -312,7 +333,6 @@ class DQVSP:
                 "n_scored_emissions": sum(r["n_draws"] for r in rows),
             },
         }
-        ck_dir = checkpointsdir(a.experiment)
         ck = os.path.join(ck_dir, "checkpoint.pth")
         torch.save({"results": results, "state_dict": net.state_dict()}, ck)
         with open(os.path.join(ck_dir, "results.json"), "w") as fh:
