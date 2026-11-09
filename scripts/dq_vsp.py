@@ -275,7 +275,7 @@ class DQVSP:
                                for k, t in net.state_dict().items()}
                 else:
                     n_stale += 1
-                    if n_stale >= patience and warmup_per_m == 0:
+                    if n_stale >= patience:
                         print(f"[early stop] val stale {n_stale}x at step "
                               f"{step}; best {best_val:.4e} restored",
                               flush=True)
