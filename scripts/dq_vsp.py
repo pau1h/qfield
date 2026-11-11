@@ -48,6 +48,7 @@ from qfield.designed_quadrature.cond_net import (  # noqa: E402
 )
 from qfield.kernels import median_heuristic_sigma_sq  # noqa: E402
 from vspsampling.download import DATASET as VSP_DATASET  # noqa: E402
+from vspsampling import LayeredPrior, TraveltimeOperator  # noqa: E402
 from vspsampling.download import REPO as VSP_ROOT  # noqa: E402
 from _vsp_samples import VSPDDPMSampler, training_batches  # noqa: E402
 
@@ -95,24 +96,37 @@ class DQVSP:
         self.sampler = VSPDDPMSampler(self.dev, n_steps=int(args.ddim_steps))
         torch.set_default_dtype(DTYPE)
 
-        # Read only the selected rows; the full dataset is large.
+        #Select training observations in random order, similar to the Darcy problem.
         with h5py.File(os.path.join(VSP_ROOT, VSP_DATASET), "r") as f:
-            splits = f["split"][:]
-            rng = np.random.default_rng(int(args.base_seed) + 41)
-            tr_idx = np.sort(rng.choice(np.flatnonzero(splits == 0),
-                                        size=int(args.n_train_obs),
-                                        replace=False))
-            ev_idx = np.sort(rng.choice(np.flatnonzero(splits == 1),
-                                        size=int(args.n_eval_obs),
-                                        replace=False))
-            self.y_tr_raw = torch.as_tensor(f["y"][tr_idx],
-                                            dtype=torch.float32)
-            self.y_ev_raw = torch.as_tensor(f["y"][ev_idx],
-                                            dtype=torch.float32)
-            self.xi_true_ev = torch.as_tensor(f["xi"][ev_idx],
-                                              dtype=torch.float32)
+            train_rows = np.flatnonzero(f["split"][:] == 0)
+            n_train = int(args.n_train_obs)
+            if not 8 <= n_train <= len(train_rows):
+                raise ValueError("n_train_obs must be between 8 and the available train rows")
+            gen = torch.Generator().manual_seed(int(args.base_seed) + 41)
+            pick = torch.randperm(len(train_rows), generator=gen)[:n_train].numpy()
+            tr_idx = train_rows[pick]
+            order = np.argsort(tr_idx)
+            # h5py requires sorted reads; restore the randomly selected order.
+            y_raw = f["y"][tr_idx[order]][np.argsort(order)]
+            self.y_tr_raw = torch.as_tensor(y_raw, dtype=torch.float32)
             self.depths = f["depths"][:]
             self.attrs = dict(f.attrs)
+
+        # Fresh simulator observations, unused by the pretrained DDPM.
+        rng = np.random.default_rng(int(args.base_seed) + 777_000)
+        xi_ev = rng.standard_normal((int(args.n_eval_obs), self.d))
+        prior = LayeredPrior(self.depths)
+        op = TraveltimeOperator()
+        try:
+            with torch.no_grad():
+                y_ev = op(prior(torch.as_tensor(xi_ev, dtype=DTYPE))).numpy()
+        finally:
+            op.close()
+        y_ev = y_ev + float(self.attrs["sigma"]) * rng.standard_normal(y_ev.shape)
+        if not np.isfinite(y_ev).all():
+            raise RuntimeError("Non-finite simulated evaluation observations")
+        self.y_ev_raw = torch.as_tensor(y_ev, dtype=torch.float32)
+        self.xi_true_ev = torch.as_tensor(xi_ev, dtype=torch.float32)
 
         self.y_tr = self.sampler.normalize(self.y_tr_raw)
         self.y_ev = self.sampler.normalize(self.y_ev_raw)
@@ -168,13 +182,10 @@ class DQVSP:
               flush=True)
         opt = torch.optim.Adam(net.parameters(), lr=float(a.lr))
 
-        # Held-out validation family: whole observations, never seen by the
-        # trainer, scored on the same objective at a fixed generator every
-        # val_every steps. Early stop on validation, patience 8.
         n_vf = max(1, min(64, self.y_tr.shape[0] // 8))
         y_val = self.y_tr[-n_vf:]
         self.y_tr = self.y_tr[:-n_vf]
-        val_every, patience = 200, 8
+        val_every, patience = 200, int(a.patience) #makes early stopping configurable
         best_val, n_stale, best_sd = float("inf"), 0, None
         small = int(a.n_steps) <= 10
         n_val_nodes, n_val_bank = (16, 48) if small else (128, 1024)
@@ -205,7 +216,7 @@ class DQVSP:
         sampling_times, training_times = [], []
         timing_by_m = {int(m): {"sampling": [], "gradient": [],
                                 "training": []} for m in self.m_list}
-        # M cycles round-robin so every budget is timed equally often; the
+        # M is randomly sampled.
         # first 5 passes per M are warm-up and excluded from timing. While
         # warm-up is on, early stopping is off to keep the schedule balanced.
         warmup_per_m = 5 if int(a.n_steps) >= 5 * len(self.m_list) else 0
@@ -279,9 +290,8 @@ class DQVSP:
                         print(f"[early stop] val stale {n_stale}x at step "
                               f"{step}; best {best_val:.4e} restored",
                               flush=True)
-                        break
             completed = step + 1
-            if completed % 5000 == 0 or completed == int(a.n_steps):
+            if (n_stale >= patience or completed % 5000 == 0 or completed == int(a.n_steps)): #preserves the early stopping decision while saving checkpoint first
                 path = os.path.join(ck_dir, f"step_{completed:06d}.pth")
                 tmp = path + ".tmp"
                 torch.save({
@@ -300,6 +310,8 @@ class DQVSP:
                 }, tmp)
                 os.replace(tmp, path)
                 print(f"Saved snapshot to {path}", flush=True)
+            if n_stale >= patience:
+             break
 
         batches.close()  # Releases workers after normal completion or early stop.
         sample_label = "batch wait" if int(a.sampler_workers) else "DDPM"
@@ -415,7 +427,7 @@ class DQVSP:
         rows = []
         y_cpu = self.y_ev.double().cpu()
         assert self.y_ev.shape[0] >= 2
-        perm = torch.roll(torch.arange(self.y_ev.shape[0]), shifts=1)
+        perm = torch.roll(torch.arange(self.y_ev.shape[0]), shifts=7)
         y_const = y_cpu.mean(dim=0)
         inv2s = 1.0 / (2.0 * self.sigma ** 2)
         ctrl = None
